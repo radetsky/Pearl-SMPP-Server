@@ -25,8 +25,15 @@ Pearl::SMPP::Server
 	port => 9900, 
     authentication => sub { 
       my ( $system_id, $secret, $host, $port ) = @_;
-      my $id = $host . ":" . $port; 
-      return $id;  # return undef if fail
+      my $user = {
+          system_id => $system_id, 
+          bandwidth => 10, 
+          active = 1, 
+          allowed_ip = '0.0.0.0',
+          allowed_src= 'test,alpha,beta',
+          max_connections = 10
+      }
+      return $user;   # return undef if fail
     },
 
     authorization => sub { 
@@ -61,15 +68,22 @@ Pearl::SMPP::Server
 Pearl SMPP Server - это асинхронный сервер, построенный на базе AnyEvent tcp_server + PacketReader. 
 Используемые callback-и, которые должен обеспечить внешний разработчик: 
 1. authentication - аутентификация. Входящие параметры: host, port, system_id, secret.  
-Должен возвращать 1, если ОК, undef - если аутентификация не удалась. 
-
+Должен возвращать hashref-> с записями о пользователе, если ОК, undef - если аутентификация не удалась. 
 2. authorization - авторизация. Проверка на возможность использовании А-имени $source пользователем $system_id
+
 3. rps - пока не используется 
 4. outbound_q - вызывается по timeout в 1 сек.  Проверка исходящей очереди для $system_id. В качестве результата должна 
 возвращать массив Pearl::SMPP::PDU.  
 
 TODO: 
-- проверять количество одновременный соединений.  
+- Установить AnyEvent какой-нибудь таймер на 1 секунду для проверки наличия исходящих сообщений 
+- Заюзать Unix-socket для передачи оперативной информации между процессами: 
+ + оперативно сообщать о новых коннектах и пакетах 
+ + сообщать о текущем статусе подключений и статистике с момента запуска 
+ + принимать сообщения с командами
+  - Reload config (?) нужен ли ? 
+  + Kill $HIM when $HIM == system_id 
+- проверять количество одновременных соединений.  
 - проверять количество пакетов в секунду
 
 =cut
@@ -88,6 +102,7 @@ use AnyEvent::PacketReader;
 use Data::Dumper; 
 use Errno ':POSIX';
 use SMPP::Packet; 
+use Log::Log4perl qw(get_logger); 
 
 #use Pearl::SMPP::PDU; 
 
@@ -157,6 +172,7 @@ use constant ESME_ROK         => 0x00000000;
 use constant ESME_RINVPASWD   => 0x0000000e; 
 use constant ESME_RALYBND     => 0x00000005; 
 use constant ESME_RSUBMITFAIL => 0x00000045;
+use constant ESME_RINVSRCADR  => 0x0000000a;
 
 
 
@@ -242,11 +258,13 @@ sub new {
 	
 	$this->{host} = $params{host};
   $this->{port} = $params{port}?$params{port}:2599;
+  $this->{on_bound} = $params{on_bound}; 
   $this->{system_id} = $params{system_id}?$params{system_id}:'PearlSMPP'; 
   $this->{authentication} = $params{authentication}; 
   $this->{authorization} = $params{authorization};
   $this->{submit_sm} = $params{submit_sm}; 
   $this->{outbound_q} = $params{outbound_q}; 
+  $this->{disconnect} = $params{disconnect}; 
   $this->{debug} = $params{debug}?$params{debug}:undef; 
   $this->{reader} = undef; 
   $this->{connections} = {}; 
@@ -256,7 +274,7 @@ sub new {
     $this->{port}, 
     sub {
       my ( $socket, $fromhost, $fromport ) = @_; 
-      warn "Connect from $fromhost:$fromport\n" if $this->{debug}; 
+      # warn "Connect from $fromhost:$fromport\n" if $this->{debug}; 
       my $connection_id = $fromhost . ":" . $fromport; 
       $this->{connections}->{$connection_id}->{'state'} = 'OPEN'; 
 
@@ -266,7 +284,7 @@ sub new {
           } elsif ($! == EPIPE) {
             $this->close_connection ( $fromhost, $fromport); 
           } else {
-            warn "Network error: $!"; 
+            # warn "Network error: $!"; 
             $this->close_connection ( $fromhost, $fromport); 
           }
       } );
@@ -274,7 +292,7 @@ sub new {
     }, 
     sub {
           my ($fh, $thishost, $thisport) = @_;
-          warn "Bound to $thishost, port $thisport." if $this->{debug}; 
+          $this->{on_bound}($fh, $thishost, $thisport); 
     } ); 
 
 	return bless $this, 'Pearl::SMPP::Server';
@@ -282,9 +300,10 @@ sub new {
 
 sub close_connection {
   my ($this, $fromhost, $fromport) = @_; 
-  warn "Closing connection from $fromhost:$fromport\n" if $this->{debug}; 
+  #warn "Closing connection from $fromhost:$fromport\n" if $this->{debug}; 
   my $connection_id = $fromhost . ":" . $fromport; 
   delete $this->{connections}->{$connection_id}; 
+  $this->{disconnect}($fromhost,$fromport); 
 
   return 1; 
 }
@@ -292,13 +311,23 @@ sub close_connection {
 sub process_packet {
 
 	my ( $this, $socket, $fromhost, $fromport, $packet ) = @_;
-  warn "Packet from $fromhost:$fromport \n" if $this->{debug}; 
+  warn "PDU <- $fromhost:$fromport \n" if $this->{debug}; 
   _hexdump ($packet) if $this->{debug}; 
 
-  my $pdu  = SMPP::Packet::unpack_pdu( { version => 0x34, data => $packet} ); 
-  my $resp = $this->process_pdu ($socket, $fromhost, $fromport, $pdu); 
-  if ($resp) { syswrite $socket, $resp; } 
+  my $pdu  = SMPP::Packet::unpack_pdu( $packet ); 
+  warn "Unpacked PDU from $fromhost:$fromport\n" if $this->{debug}; 
+  warn Dumper $pdu if $this->{debug}; 
 
+  my $resp = $this->process_pdu ($socket, $fromhost, $fromport, $pdu); 
+  if ($resp) { 
+    syswrite $socket, $resp; 
+    if ($this->{debug}) { 
+      warn "PDU -> $fromhost:$fromport\n";
+      _hexdump($resp);
+      warn "Unpacked PDU to $fromhost:$fromport\n"; 
+      warn Dumper SMPP::Packet::unpack_pdu( $resp );
+    }
+  } 
 
 }
 
@@ -347,34 +376,37 @@ sub handle_submit_sm {
           version => 0x34, 
           status => ESME_RSUBMITFAIL, 
           seq => $pdu->{seq},
-          command => 'submit_sm_resp'
+          command => 'submit_sm_resp',
+          message_id => 0,
         }
       ); 
       return $submit_sm_resp; 
   }
   # Ему таки можно посылать сообщения 
   # Проверяем  А-имя 
-  my $system_id = $this->{connections}->{$connection_id}->{'system_id'}; 
-  unless ( defined ( $this->{authorization}($system_id, $pdu->{'source_addr'}))) { 
+  # my $system_id = $this->{connections}->{$connection_id}->{'system_id'}; 
+  unless ( defined ( $this->{authorization}($fromhost,$fromport, $pdu->{'source_addr'}))) { 
       $submit_sm_resp = SMPP::Packet::pack_pdu (
         { 
-          status => ESME_RSUBMITFAIL,  
+          status => ESME_RINVSRCADR,  
           seq => $pdu->{seq},
           command => 'submit_sm_resp', 
-          version => 0x34
+          version => 0x34,
+          message_id => 0,
         }
       ); 
       return $submit_sm_resp; 
   }
 
-  my $message_id = $this->{submit_sm}($system_id, $pdu);
+  my $message_id = $this->{submit_sm}($fromhost,$fromport, $pdu);
   unless ( defined ( $message_id ) ) { 
     $submit_sm_resp = SMPP::Packet::pack_pdu (
         { 
           status => ESME_RSUBMITFAIL, 
           seq => $pdu->{seq},
           command => 'submit_sm_resp', 
-          version => 0x34
+          version => 0x34,
+          message_id => 0,
         }
       ); 
       return $submit_sm_resp; 
@@ -455,8 +487,9 @@ sub handle_bind_transmitter {
       ); 
       return $bind_transmitter_resp; 
   }
-
-  unless ( defined ( $this->handle_bind ( $socket, $fromhost, $fromport, $pdu ) ) ) { 
+  
+  my $authentication = $this->handle_bind ( $socket, $fromhost, $fromport, $pdu );
+  unless ( defined ( $authentication) ) { 
     $this->{connections}->{$connection_id}->{'state'} = 'OPEN'; 
     $bind_transmitter_resp = SMPP::Packet::pack_pdu ( 
       { 
@@ -472,6 +505,7 @@ sub handle_bind_transmitter {
   } else { 
     $this->{connections}->{$connection_id}->{'state'} = 'BOUND_TX'; 
     $this->{connections}->{$connection_id}->{'system_id'} = $pdu->{'system_id'};
+    $this->{connections}->{$connection_id}->{'authentication'} = $authentication;
     $bind_transmitter_resp = Pearl::SMPP::PDU->new ( 
       { 
         status => 0, 
@@ -510,7 +544,8 @@ sub handle_bind_receiver {
       return $bind_receiver_resp; 
   }
 
-  unless ( defined ( $this->handle_bind ( $socket, $fromhost, $fromport, $pdu ) ) ) { 
+  my $authentication = $this->handle_bind ( $socket, $fromhost, $fromport, $pdu );
+  unless ( defined ( $authentication ) ) { 
     $this->{connections}->{$connection_id}->{'state'} = 'OPEN'; 
     $bind_receiver_resp = SMPP::Packet::pack_pdu ( 
       { 
@@ -526,6 +561,8 @@ sub handle_bind_receiver {
   } else { 
     $this->{connections}->{$connection_id}->{'state'} = 'BOUND_RX'; 
     $this->{connections}->{$connection_id}->{'system_id'} = $pdu->{'system_id'};
+    $this->{connections}->{$connection_id}->{'authentication'} = $authentication;
+
     $bind_receiver_resp = SMPP::Packet::pack_pdu ( 
       { 
         status => 0, 
@@ -562,7 +599,8 @@ sub handle_bind_transceiver {
       return $bind_transceiver_resp;
   }
 
-  unless ( defined ( $this->handle_bind ( $socket, $fromhost, $fromport, $pdu ) ) ) { 
+  my $authentication = $this->handle_bind ( $socket, $fromhost, $fromport, $pdu );
+  unless ( defined ( $authentication ) ) { 
     $this->{connections}->{$connection_id}->{'state'} = 'OPEN'; 
     $bind_transceiver_resp = SMPP::Packet::pack_pdu ( 
       { 
@@ -578,13 +616,13 @@ sub handle_bind_transceiver {
   } else { 
     $this->{connections}->{$connection_id}->{'state'} = 'BOUND_TRX'; 
     $this->{connections}->{$connection_id}->{'system_id'} = $pdu->{'system_id'};
+    $this->{connections}->{$connection_id}->{'authentication'} = $authentication;
 
     $bind_transceiver_resp = SMPP::Packet::pack_pdu ( 
       { 
         version   => 0x34,
         status => 0, 
         seq => $pdu->{seq}, 
-        command_id => CMD_bind_transceiver_resp,
         command => 'bind_transceiver_resp', 
         system_id => $this->{system_id}
       }
@@ -604,6 +642,7 @@ sub handle_enquire_link {
       status => 0, 
       seq => $pdu->{seq}, 
       command_id => 0x80000015, # enquire_link_resp
+      version => 0x34
     }
   ); 
 
@@ -633,6 +672,7 @@ __END__
 
 =head1 EXAMPLES
 
+see examples/smppd_example.pl 
 
 =head1 BUGS
 
