@@ -264,6 +264,7 @@ sub new {
   $this->{authorization} = $params{authorization};
   $this->{submit_sm} = $params{submit_sm}; 
   $this->{outbound_q} = $params{outbound_q}; 
+  $this->{on_deliver_sm_resp} = $params{handle_deliver_sm_resp}; 
   $this->{disconnect} = $params{disconnect}; 
   $this->{debug} = $params{debug}?$params{debug}:undef; 
   $this->{reader} = undef; 
@@ -277,6 +278,7 @@ sub new {
       # warn "Connect from $fromhost:$fromport\n" if $this->{debug}; 
       my $connection_id = $fromhost . ":" . $fromport; 
       $this->{connections}->{$connection_id}->{'state'} = 'OPEN'; 
+      $this->{connections}->{$connection_id}->{'socket'} = $socket; 
 
       $this->{reader} = packet_reader ( $socket, 'N@!0', 1e6, sub {
           if (defined $_[0]) {
@@ -293,7 +295,10 @@ sub new {
     sub {
           my ($fh, $thishost, $thisport) = @_;
           $this->{on_bound}($fh, $thishost, $thisport); 
-    } ); 
+    } 
+  );
+
+  $this->{timer} = AnyEvent->timer ( after => 5, cb => sub { $this->handle_outbound(); } , interval => 5); 
 
 	return bless $this, 'Pearl::SMPP::Server';
 }
@@ -355,11 +360,32 @@ sub process_pdu {
       return $this->handle_submit_sm_sulti( $socket, $fromhost, $fromport, $pdu ); 
   } elsif ( $pdu_cmd eq 'generic_nack') { 
       return $this->handle_generic_nack( $socket, $fromhost, $fromport, $pdu ); 
+  } elsif ( $pdu_cmd eq 'deliver_sm_resp') { 
+      return $this->handle_deliver_sm_resp ( $socket, $fromhost, $fromport, $pdu ); 
   } else { 
       warn "Received unknown PDU from $fromhost:$fromport with command_id=".Dumper ($pdu->{command_id}) . "\n" if $this->{debug};
       return  $this->handle_generic_nack( $socket, $fromhost, $fromport, $pdu );    
   }
 
+}
+
+sub handle_deliver_sm_resp { 
+  my ( $this, $socket, $fromhost, $fromport, $pdu ) = @_; 
+  #warn 'Delete from MySQL something with message_id= or receipted_message_id='.$pdu->{'message_id'} if $this->{debug}; 
+
+  return $this->{on_deliver_sm_resp}($fromhost,$fromport,$pdu); 
+}
+
+sub handle_generic_nack { 
+  my ( $this, $socket, $fromhost, $fromport, $pdu ) = @_; 
+
+  warn "Generic NACK for unknown PDU." if $this->{debug}; 
+
+  return SMPP::Packet::pack_pdu ( { 
+    version => 0x34, 
+    seq => $pdu->{seq}, 
+    command => 'generic_nack'
+  } ); 
 }
 
 sub handle_submit_sm { 
@@ -650,6 +676,48 @@ sub handle_enquire_link {
 
 }
 
+sub handle_outbound { 
+  my ($this) = @_; 
+
+  my $outbound = $this->{outbound_q}(); 
+  unless ( defined ( keys %{ $outbound } )) { return undef; }
+
+  #warn Dumper $outbound; 
+  foreach my $system_id ( keys %{ $outbound }) { 
+    my $messages = $outbound->{$system_id}; 
+    #warn Dumper $messages; 
+    next unless ( defined ( $messages ) ); 
+    warn "Outbound ready to $system_id" if $this->{'debug'};  
+    unless ( defined ( $this->_send_outbound($system_id, $messages) ) ) { 
+      warn "Can't send outbound to $system_id"; 
+    }
+  }
+}
+
+sub _send_outbound { 
+  my ($this, $system_id, $PDUs ) = @_; 
+
+  my $socket = $this->_find_socket($system_id); 
+  return undef unless defined $socket; 
+  foreach my $id ( keys %{ $PDUs } ) { 
+    warn "PDU -> $system_id:\n" . Dumper SMPP::Packet::unpack_pdu($PDUs->{$id}); 
+    syswrite $socket, $PDUs->{$id};
+  }
+}
+
+sub _find_socket { 
+  my ($this, $system_id) = @_; 
+
+  foreach my $connection_id ( %{ $this->{connections} } ) { 
+    if ( defined ( $this->{connections}->{$connection_id}->{'system_id'} )) { 
+      if ($this->{connections}->{$connection_id}->{'system_id'} eq $system_id) { 
+        return $this->{connections}->{$connection_id}->{'socket'}; 
+      }
+    }
+  } 
+  return undef; 
+
+}
 sub _hexdump {
     local ($!, $@);
     no warnings qw(uninitialized);
