@@ -667,8 +667,8 @@ sub handle_enquire_link {
     { 
       status => 0, 
       seq => $pdu->{seq}, 
-      command_id => 0x80000015, # enquire_link_resp
-      version => 0x34
+      version => 0x34, 
+      command => 'enquire_link_resp'
     }
   ); 
 
