@@ -280,7 +280,7 @@ sub new {
       $this->{connections}->{$connection_id}->{'state'} = 'OPEN'; 
       $this->{connections}->{$connection_id}->{'socket'} = $socket; 
 
-      $this->{reader} = packet_reader ( $socket, 'N@!0', 1e6, sub {
+      my $watcher = packet_reader ( $socket, 'N@!0', 1e6, sub {
           if (defined $_[0]) {
             $this->process_packet ( $socket, $fromhost, $fromport, $_[0]); 
           } elsif ($! == EPIPE) {
@@ -290,6 +290,7 @@ sub new {
             $this->close_connection ( $fromhost, $fromport); 
           }
       } );
+      $this->{watchers}->{$watcher} = $watcher; 
       return;
     }, 
     sub {
@@ -671,7 +672,7 @@ sub handle_enquire_link {
       command => 'enquire_link_resp'
     }
   ); 
-  
+
   return $enquire_link_resp; 
 
 }
