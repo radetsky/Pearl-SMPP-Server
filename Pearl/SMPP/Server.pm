@@ -671,7 +671,7 @@ sub handle_enquire_link {
       command => 'enquire_link_resp'
     }
   ); 
-
+  
   return $enquire_link_resp; 
 
 }
