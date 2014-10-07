@@ -299,7 +299,7 @@ sub new {
     } 
   );
 
-  $this->{timer} = AnyEvent->timer ( after => 5, cb => sub { $this->handle_outbound(); } , interval => 5); 
+  $this->{timer} = AnyEvent->timer ( after => 5, cb => sub { $this->handle_outbound(); } , interval => 1); 
 
 	return bless $this, 'Pearl::SMPP::Server';
 }
@@ -698,11 +698,20 @@ sub handle_outbound {
 sub _send_outbound { 
   my ($this, $system_id, $PDUs ) = @_; 
 
-  my $socket = $this->_find_socket($system_id); 
+  my ($socket,$connection_id) = $this->_find_socket($system_id); 
   return undef unless defined $socket; 
+
+  my ($host,$port) = split(':',$connection_id); 
+
   foreach my $id ( keys %{ $PDUs } ) { 
     warn "PDU -> $system_id:\n" . Dumper SMPP::Packet::unpack_pdu($PDUs->{$id}); 
-    syswrite $socket, $PDUs->{$id};
+    my $result = syswrite $socket, $PDUs->{$id};
+    unless ( defined ( $result ) ) { 
+      warn "Can't write to socket: " . Dumper $socket . "\nBecause: $!"; 
+      close $socket; 
+      $this->close_connection($host,$port); 
+    }
+    warn "Written to socket $results bytes." if $this->{'debug'}; 
   }
 }
 
@@ -712,13 +721,15 @@ sub _find_socket {
   foreach my $connection_id ( %{ $this->{connections} } ) { 
     if ( defined ( $this->{connections}->{$connection_id}->{'system_id'} )) { 
       if ($this->{connections}->{$connection_id}->{'system_id'} eq $system_id) { 
-        return $this->{connections}->{$connection_id}->{'socket'}; 
+        return ($this->{connections}->{$connection_id}->{'socket'}, $connection_id); 
       }
     }
   } 
-  return undef; 
+  return (undef, undef); 
 
 }
+
+
 sub _hexdump {
     local ($!, $@);
     no warnings qw(uninitialized);
