@@ -278,7 +278,7 @@ sub new {
     $this->{port}, 
     sub {
       my ( $socket, $fromhost, $fromport ) = @_; 
-      # warn "Connect from $fromhost:$fromport\n" if $this->{debug}; 
+      warn "Connect from $fromhost:$fromport\n" if $this->{debug}; 
       my $connection_id = $fromhost . ":" . $fromport; 
       $this->{connections}->{$connection_id}->{'state'} = 'OPEN'; 
       $this->{connections}->{$connection_id}->{'socket'} = $socket; 
@@ -296,16 +296,15 @@ sub new {
           } elsif ($! == EPIPE) {
             $this->close_connection ( $fromhost, $fromport); 
           } else {
-            # warn "Network error: $!"; 
+            warn "Network error: $!"; 
             $this->close_connection ( $fromhost, $fromport); 
           }
-      },  
-         sub { $this->check_outbound ( $socket, $fromhost, $fromport ); }
+      }  
       );
-#      my $timer = AnyEvent->timer ( after => 1, interval => 1, cb => sub { $this->check_outbound ( $socket, $fromhost, $fromport ); } ); 
+      my $timer = AnyEvent->timer ( after => 1, interval => 1, cb => sub { $this->check_outbound ( $socket, $fromhost, $fromport ); } ); 
 
       $this->{watchers}->{$watcher} = $watcher; 
-#      $this->{watchers}->{'timer'} = $timer; 
+      $this->{watchers}->{'timer'} = $timer; 
       return;
     }, 
     sub {
