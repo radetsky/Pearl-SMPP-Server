@@ -252,11 +252,14 @@ use constant status_code => {
 
 
 sub new {
-	my ( $class, %params ) = @_;
+  my ( $class, %params ) = @_;
+  my $this = {}; 
 
-	my $this = {}; 
+  $this->{_cv} = AnyEvent->condvar(); 
+  $this->{_ptime} = time() - 1;   
+  $this->{_answers} = []; 
 	
-	$this->{host} = $params{host};
+  $this->{host} = $params{host};
   $this->{port} = $params{port}?$params{port}:2599;
   $this->{on_bound} = $params{on_bound}; 
   $this->{system_id} = $params{system_id}?$params{system_id}:'PearlSMPP'; 
@@ -280,17 +283,29 @@ sub new {
       $this->{connections}->{$connection_id}->{'state'} = 'OPEN'; 
       $this->{connections}->{$connection_id}->{'socket'} = $socket; 
 
+
+	# Чередовать packetreader c timer. 
+	# Таймер выставить на 0.1 и выдать пакетов bandwidth/10 
+	# Судя по всему надо залезть внутрь PacketReader и ограничить sysread таймаутом
+	# Так же не помешает выставить AnyEvfent::Packetreader::debug в 1, что бы видеть отладочную информацию
+	#
+
       my $watcher = packet_reader ( $socket, 'N@!0', 1e6, sub {
           if (defined $_[0]) {
-            $this->process_packet ( $socket, $fromhost, $fromport, $_[0]); 
+            $this->process_packet ( $socket, $fromhost, $fromport, $_[0]);
           } elsif ($! == EPIPE) {
             $this->close_connection ( $fromhost, $fromport); 
           } else {
             # warn "Network error: $!"; 
             $this->close_connection ( $fromhost, $fromport); 
           }
-      } );
+      },  
+         sub { $this->check_outbound ( $socket, $fromhost, $fromport ); }
+      );
+#      my $timer = AnyEvent->timer ( after => 1, interval => 1, cb => sub { $this->check_outbound ( $socket, $fromhost, $fromport ); } ); 
+
       $this->{watchers}->{$watcher} = $watcher; 
+#      $this->{watchers}->{'timer'} = $timer; 
       return;
     }, 
     sub {
@@ -299,9 +314,7 @@ sub new {
     } 
   );
 
-  $this->{timer} = AnyEvent->timer ( after => 5, cb => sub { $this->handle_outbound(); } , interval => 1); 
-
-	return bless $this, 'Pearl::SMPP::Server';
+  return bless $this, 'Pearl::SMPP::Server';
 }
 
 sub close_connection {
@@ -316,7 +329,7 @@ sub close_connection {
 
 sub process_packet {
 
-	my ( $this, $socket, $fromhost, $fromport, $packet ) = @_;
+  my ( $this, $socket, $fromhost, $fromport, $packet ) = @_;
   warn "PDU <- $fromhost:$fromport \n" if $this->{debug}; 
   _hexdump ($packet) if $this->{debug}; 
 
@@ -326,13 +339,17 @@ sub process_packet {
 
   my $resp = $this->process_pdu ($socket, $fromhost, $fromport, $pdu); 
   if ($resp) { 
-    syswrite $socket, $resp; 
+
     if ($this->{debug}) { 
       warn "PDU -> $fromhost:$fromport\n";
       _hexdump($resp);
       warn "Unpacked PDU to $fromhost:$fromport\n"; 
       warn Dumper SMPP::Packet::unpack_pdu( $resp );
     }
+
+    syswrite $socket, $resp;
+    # push @{$this->{_answers}}, { socket => $socket, pdu => $resp }; 
+
   } 
 
 }
@@ -347,6 +364,7 @@ sub process_pdu {
 
   if ( $pdu_cmd eq 'enquire_link' ) {
       return $this->handle_enquire_link( $socket, $fromhost, $fromport, $pdu );
+#       return undef; # for Pearl-SMS-Stream test purpose
   } elsif ( $pdu_cmd eq 'bind_transmitter' ) { 
       return $this->handle_bind_transmitter ( $socket, $fromhost, $fromport, $pdu ); 
   } elsif ( $pdu_cmd eq 'bind_receiver') { 
@@ -677,9 +695,63 @@ sub handle_enquire_link {
 
 }
 
+sub _send_answers { 
+  my ($this) = @_; 
+
+  my $a = @{$this->{_answers}}; 
+  return 0 unless $a; 
+
+  my $i = 0; 
+  
+  foreach my $a ( @{$this->{_answers}} ) { 
+	syswrite $a->{socket}, $a->{pdu}; 
+	$i++; 
+  }
+  undef $this->{_answers}; 
+  $this->{_answers} = [];  
+
+  return $i; 
+
+}
+
+sub check_outbound { 
+   my ($this, $socket, $fromhost, $fromport) = @_;
+
+   my $connection_id = $fromhost . ':' . $fromport;
+
+   if ($this->{_ptime} >= time()) { return undef; } 
+   $this->{_ptime} = time(); 
+
+   $this->{debug} and warn "Pearl SMPP Server [ check outbound for $connection_id ]";
+ 
+   if ( ($this->{connections}->{$connection_id}->{'state'} eq 'BOUND_TRX') or 
+	($this->{connections}->{$connection_id}->{'state'} eq 'BOUND_RX')) { 
+
+ 
+   my $outbound = $this->{outbound_q}($socket, $fromhost, $fromport); 
+   unless ( defined ( keys %{ $outbound } )) { return undef; }
+
+  foreach my $id ( keys %{ $outbound } ) {
+    my $result = syswrite $socket, $outbound->{$id};
+    unless ( defined ( $result ) ) {
+      warn "Can't write to socket: " . Dumper $socket . "\nBecause: $!";
+      $this->close_connection($fromhost,$fromport);
+      return;
+    }
+    warn "Written to socket $result bytes." if $this->{'debug'};
+  }
+ }
+  
+
+}
 sub handle_outbound { 
   my ($this) = @_; 
 
+  if ($this->{_ptime} >= time() ) { 
+	return undef; 
+  }
+
+  $this->{_ptime} = time(); 
   my $outbound = $this->{outbound_q}(); 
   unless ( defined ( keys %{ $outbound } )) { return undef; }
 
@@ -693,6 +765,7 @@ sub handle_outbound {
       warn "Can't send outbound to $system_id"; 
     }
   }
+
 }
 
 sub _send_outbound { 
@@ -708,15 +781,17 @@ sub _send_outbound {
     my $result = syswrite $socket, $PDUs->{$id};
     unless ( defined ( $result ) ) { 
       warn "Can't write to socket: " . Dumper $socket . "\nBecause: $!"; 
-      close $socket; 
-      $this->close_connection($host,$port); 
+      $this->close_connection($host,$port);
+      return; 
     }
-    warn "Written to socket $results bytes." if $this->{'debug'}; 
+    warn "Written to socket $result bytes." if $this->{'debug'}; 
   }
 }
 
 sub _find_socket { 
   my ($this, $system_id) = @_; 
+
+  #warn Dumper $this->{connections}; 
 
   foreach my $connection_id ( %{ $this->{connections} } ) { 
     if ( defined ( $this->{connections}->{$connection_id}->{'system_id'} )) { 
